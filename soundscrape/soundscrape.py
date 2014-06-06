@@ -4,6 +4,8 @@ import soundcloud
 import requests
 import sys
 import argparse
+import threading
+import Queue
 
 from mutagen.easyid3 import ID3, EasyID3 
 from mutagen.mp3 import EasyMP3
@@ -15,6 +17,38 @@ CLIENT_ID = '22e566527758690e6feb2b5cb300cc43'
 CLIENT_SECRET = '3a7815c3f9a82c3448ee4e7d3aa484a4'
 MAGIC_CLIENT_ID = 'b45b1aa10f1ac2941910a7f0d10f8e28'
 
+class ThreadPool:
+    def __init__(self, n, func):
+        self.workers = [threading.Thread(target=self._worker) for i in xrange(n)]
+        for i in self.workers:
+            i.daemon = True
+
+        self.task_queue = Queue.Queue(64)
+        self.func = func
+
+        # Start workers
+        self.running = True
+        [x.start() for x in self.workers]
+
+    def _worker(self):
+        while(self.running):
+            try:
+                job, callback = self.task_queue.get(True, 2)
+                res = self.func(job)
+                self.task_queue.task_done()
+                callback(res)
+            except Queue.Empty:
+                continue
+
+    def submit(self, job, callback):
+        self.task_queue.put((job, callback))
+
+    def join(self):
+        self.task_queue.join()
+        self.running = False
+        for i in self.workers:
+            i.join()
+
 def main():
     parser = argparse.ArgumentParser(description='SoundScrape. Scrape an artist from SoundCloud.\n')
     parser.add_argument('artist_url', metavar='U', type=str,
@@ -25,6 +59,8 @@ def main():
                         help='Use if downloading tracks from a SoundCloud group')
     parser.add_argument('-t', '--track', type=str, default='',
                         help='The name of a specific track by an artist')
+    parser.add_argument('-j', '--threads', type=int, default=1,
+                        help="The number of concurrent downloads to allow")
 
     args = parser.parse_args()
     vargs = vars(args)
@@ -43,6 +79,7 @@ def main():
         else:
             artist_url = 'https://soundcloud.com/' + artist_url.lower()
 
+    pool = ThreadPool(args.threads, download_file)
     client = soundcloud.Client(client_id=CLIENT_ID)
     if one_track:
         resolved = client.get('/resolve', url=track_url)
@@ -70,72 +107,82 @@ def main():
         num_tracks = 1;
     else:
         num_tracks = vargs['num_tracks']
-    download_tracks(client, tracks, num_tracks)
+    download_tracks(client, pool, tracks, num_tracks)
 
-def download_tracks(client, tracks, num_tracks=sys.maxint):
+def download_tracks(client, pool, tracks, num_tracks=sys.maxint):
+    try:
+        for i, track in enumerate(tracks):
+            # "Track" and "Resource" objects are actually different, 
+            # even though they're the same. 
+            if isinstance(track, soundcloud.resource.Resource):
+                try:
+                    t_track = {}
+                    t_track['downloadable'] = track.downloadable
+                    t_track['streamable'] = track.streamable
+                    t_track['title'] = track.title
+                    t_track['user'] = {'username': track.user['username']}
+                    t_track['release_year'] = track.release
+                    t_track['genre'] = track.genre
+                    if track.downloadable:
+                        t_track['stream_url'] = track.download_url
+                    else:
+                        if hasattr(track, 'stream_url'):
+                            t_track['stream_url'] = track.stream_url
+                        else:
+                            t_track['direct'] = True
+                            t_track['stream_url'] = 'https://api.soundcloud.com/tracks/' + \
+                                str(track.id) + '/stream?client_id=' + MAGIC_CLIENT_ID
+                    track = t_track
+                except Exception, e:
+                    puts(track.title.encode('utf-8') + colored.red(u' is not downloadable') + '.')
+                    continue
 
-    for i, track in enumerate(tracks):
-
-        # "Track" and "Resource" objects are actually different, 
-        # even though they're the same. 
-        if isinstance(track, soundcloud.resource.Resource):
+            if i > num_tracks - 1:
+                continue
             try:
-                t_track = {}
-                t_track['downloadable'] = track.downloadable
-                t_track['streamable'] = track.streamable
-                t_track['title'] = track.title
-                t_track['user'] = {'username': track.user['username']}
-                t_track['release_year'] = track.release
-                t_track['genre'] = track.genre
-                if track.downloadable:
-                    t_track['stream_url'] = track.download_url
+                if not track.get('stream_url', False):
+                    puts(track['title'].encode('utf-8')  + colored.red(u' is not downloadable') + '.')
+                    continue
                 else:
-                    if hasattr(track, 'stream_url'):
-                        t_track['stream_url'] = track.stream_url
+                    puts(colored.green(u"Downloading") + ": " + track['title'].encode('utf-8'))
+                    if track.get('direct', False):
+                        location = track['stream_url']
                     else:
-                        t_track['direct'] = True
-                        t_track['stream_url'] = 'https://api.soundcloud.com/tracks/' + str(track.id) + '/stream?client_id=' + MAGIC_CLIENT_ID
-                track = t_track
+                        stream = client.get(track['stream_url'], allow_redirects=False)
+                        if hasattr(stream, 'location'):
+                            location = stream.location
+                        else:
+                            location = stream.url
+
+                    track_filename = track['user']['username'].replace('/', '-') + ' - ' + track['title'].replace('/', '-') + '.mp3'
+                    def afterwards(pth):
+                        tag_file(pth, 
+                                artist=track['user']['username'], 
+                                title=track['title'], 
+                                year=track['release_year'], 
+                                genre=track['genre'])
+                        puts(colored.green(u"Finished") + ": " + track['title'].encode("utf-8"))
+                    pool.submit((location, track_filename, track), afterwards)
             except Exception, e:
-                puts(track.title.encode('utf-8') + colored.red(u' is not downloadable') + '.')
-                continue
+                puts(colored.red(u"Problem downloading ") + track['title'].encode('utf-8') )
+                print e
+    except KeyboardInterrupt, e:
+        pass
+    pool.join()
 
-        if i > num_tracks - 1:
-            continue
-        try:
-            if not track.get('stream_url', False):
-                puts(track['title'].encode('utf-8')  + colored.red(u' is not downloadable') + '.')
-                continue
-            else:
-                puts(colored.green(u"Downloading") + ": " + track['title'].encode('utf-8'))
-                if track.get('direct', False):
-                    location = track['stream_url']
-                else:
-                    stream = client.get(track['stream_url'], allow_redirects=False)
-                    if hasattr(stream, 'location'):
-                        location = stream.location
-                    else:
-                        location = stream.url
-
-                track_filename = track['user']['username'].replace('/', '-') + ' - ' + track['title'].replace('/', '-') + '.mp3'
-                download_file(location, track_filename)
-                tag_file(track_filename, 
-                        artist=track['user']['username'], 
-                        title=track['title'], 
-                        year=track['release_year'], 
-                        genre=track['genre'])
-        except Exception, e:
-            puts(colored.red(u"Problem downloading ") + track['title'].encode('utf-8') )
-            print e
-
-def download_file(url, path):
+def download_file(job):
+    url, path, track = job
     r = requests.get(url, stream=True)
-    with open(path, 'wb') as f:
-        total_length = int(r.headers.get('content-length'))
-        for chunk in progress.bar(r.iter_content(chunk_size=1024), expected_size=(total_length/1024) + 1): 
-            if chunk: # filter out keep-alive new chunks
-                f.write(chunk)
-                f.flush()
+    try:
+        with open(path, 'wb') as f:
+            total_length = int(r.headers.get('content-length'))
+            for chunk in r.iter_content(chunk_size=1024):
+                if chunk:
+                    f.write(chunk)
+                    f.flush()
+    except Exception as e:
+        puts(colored.red("Failed downloading ") + path)
+        puts(colored.red(str(e)))
 
     return path
 
