@@ -79,7 +79,7 @@ def main():
         else:
             artist_url = 'https://soundcloud.com/' + artist_url.lower()
 
-    pool = ThreadPool(args.threads, download_file)
+    pool = None if args.threads == 1 else ThreadPool(args.threads, download_file)
     client = soundcloud.Client(client_id=CLIENT_ID)
     if one_track:
         resolved = client.get('/resolve', url=track_url)
@@ -155,14 +155,22 @@ def download_tracks(client, pool, tracks, num_tracks=sys.maxint):
                             location = stream.url
 
                     track_filename = track['user']['username'].replace('/', '-') + ' - ' + track['title'].replace('/', '-') + '.mp3'
-                    def afterwards(pth):
-                        tag_file(pth, 
+                    if(pool != None):
+                        def afterwards(pth, track):
+                            tag_file(pth, 
+                                    artist=track['user']['username'], 
+                                    title=track['title'], 
+                                    year=track['release_year'], 
+                                    genre=track['genre'])
+                            puts(colored.green(u"Finished") + ": " + track['title'].encode("utf-8"))
+                        pool.submit((location, track_filename, track, False), lambda x: afterwards(*x))
+                    else:
+                        res, track_res = download_file((location, track_filename, track, True))
+                        tag_file(res,
                                 artist=track['user']['username'], 
                                 title=track['title'], 
                                 year=track['release_year'], 
                                 genre=track['genre'])
-                        puts(colored.green(u"Finished") + ": " + track['title'].encode("utf-8"))
-                    pool.submit((location, track_filename, track), afterwards)
             except Exception, e:
                 puts(colored.red(u"Problem downloading ") + track['title'].encode('utf-8') )
                 print e
@@ -171,12 +179,14 @@ def download_tracks(client, pool, tracks, num_tracks=sys.maxint):
     pool.join()
 
 def download_file(job):
-    url, path, track = job
+    url, path, track, do_progress = job
     r = requests.get(url, stream=True)
     try:
         with open(path, 'wb') as f:
             total_length = int(r.headers.get('content-length'))
-            for chunk in r.iter_content(chunk_size=1024):
+            iterator = progress.bar(r.iter_content(chunk_size=1024), expected_size=(total_length/1024)+1) if do_progress else\
+                r.iter_content(chunk_size=1024)
+            for chunk in iterator:
                 if chunk:
                     f.write(chunk)
                     f.flush()
@@ -184,7 +194,7 @@ def download_file(job):
         puts(colored.red("Failed downloading ") + path)
         puts(colored.red(str(e)))
 
-    return path
+    return (path, track)
 
 def tag_file(filename, artist, title, year, genre):
     try:
